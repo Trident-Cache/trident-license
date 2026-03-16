@@ -5,7 +5,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use trident_license::{
-    License, LicenseCustomer, LicenseError, LicenseManager, LicenseStatus, LicenseType,
+    LicenseError, LicenseManager, LicenseStatus, LicenseType,
     LicenseVerifier,
 };
 
