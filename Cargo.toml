@@ -1,0 +1,29 @@
+[package]
+name = "trident-license"
+version = "0.1.0"
+edition = "2021"
+description = "Shared Ed25519 license verification for Trident products"
+license = "MIT"
+repository = "https://github.com/Trident-Cache/trident-license"
+publish = false
+
+[features]
+default = ["licensing"]
+licensing = ["ring", "base64", "chrono", "parking_lot"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# Only needed when licensing feature is enabled
+ring = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
+chrono = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
+parking_lot = { version = "0.12", optional = true }
+
+[dev-dependencies]
+ring = "0.17"
+base64 = "0.22"
+tempfile = "3"
