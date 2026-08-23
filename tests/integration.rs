@@ -4,10 +4,7 @@ use base64::Engine;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
-use trident_license::{
-    LicenseError, LicenseManager, LicenseStatus, LicenseType,
-    LicenseVerifier,
-};
+use trident_license::{LicenseError, LicenseManager, LicenseStatus, LicenseType, LicenseVerifier};
 
 /// Generate a test Ed25519 keypair, returning (keypair, public_key_bytes).
 fn generate_test_keypair() -> (Ed25519KeyPair, [u8; 32]) {
@@ -312,6 +309,33 @@ fn test_expired_license_via_file() {
     std::fs::write(&path, &data).unwrap();
 
     let mgr = LicenseManager::new(Some(&path), &public_key);
+    assert!(!mgr.is_licensed());
+    assert_eq!(mgr.status(), LicenseStatus::Expired);
+    assert_eq!(mgr.header_value(), Some("expired"));
+}
+
+// A licence whose file can no longer be read cannot be shed through
+// `reload` — it refuses to mutate state unless the new file verifies. A
+// caller closing a grace window over a deleted file needs `mark_expired`.
+#[test]
+fn test_mark_expired_sheds_a_licence_reload_cannot() {
+    let (keypair, public_key) = generate_test_keypair();
+    let json = commercial_license_json("2099-12-31T23:59:59Z");
+    let data = sign_payload(&keypair, &json);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("license.key");
+    std::fs::write(&path, &data).unwrap();
+
+    let mgr = LicenseManager::new(Some(&path), &public_key);
+    assert!(mgr.is_licensed());
+
+    // The file disappears; reload refuses to touch the live state.
+    std::fs::remove_file(&path).unwrap();
+    assert!(mgr.reload(&path).is_err());
+    assert!(mgr.is_licensed());
+
+    mgr.mark_expired();
     assert!(!mgr.is_licensed());
     assert_eq!(mgr.status(), LicenseStatus::Expired);
     assert_eq!(mgr.header_value(), Some("expired"));

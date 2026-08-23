@@ -97,6 +97,19 @@ mod licensed {
             Ok(())
         }
 
+        /// Force the manager into the expired state without reading any file.
+        ///
+        /// `reload` refuses to mutate state unless the new file verifies, so
+        /// a caller that must stop honouring a licence whose file can no
+        /// longer be read — a grace window closing over a deleted or
+        /// corrupted file — has no way to express that through `reload`.
+        /// The parsed licence is kept so status output can still say what
+        /// expired.
+        pub fn mark_expired(&self) {
+            self.licensed.store(false, Ordering::Relaxed);
+            *self.status.write() = LicenseStatus::Expired;
+        }
+
         /// Log the current license status at startup.
         pub fn log_status(&self) {
             let status = *self.status.read();
@@ -215,6 +228,8 @@ mod unlicensed {
         pub fn reload(&self, _path: &Path) -> Result<(), LicenseError> {
             Ok(())
         }
+
+        pub fn mark_expired(&self) {}
 
         pub fn log_status(&self) {
             info!("Licensing disabled at build time — all features enabled");
