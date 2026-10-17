@@ -314,11 +314,9 @@ fn test_expired_license_via_file() {
     assert_eq!(mgr.header_value(), Some("expired"));
 }
 
-// A licence whose file can no longer be read cannot be shed through
-// `reload` — it refuses to mutate state unless the new file verifies. A
-// caller closing a grace window over a deleted file needs `mark_expired`.
+// A missing file must immediately disable a previously valid licence.
 #[test]
-fn test_mark_expired_sheds_a_licence_reload_cannot() {
+fn test_missing_file_reload_disables_license() {
     let (keypair, public_key) = generate_test_keypair();
     let json = commercial_license_json("2099-12-31T23:59:59Z");
     let data = sign_payload(&keypair, &json);
@@ -330,10 +328,11 @@ fn test_mark_expired_sheds_a_licence_reload_cannot() {
     let mgr = LicenseManager::new(Some(&path), &public_key);
     assert!(mgr.is_licensed());
 
-    // The file disappears; reload refuses to touch the live state.
+    // The file disappears; reload must fail closed.
     std::fs::remove_file(&path).unwrap();
     assert!(mgr.reload(&path).is_err());
-    assert!(mgr.is_licensed());
+    assert!(!mgr.is_licensed());
+    assert_eq!(mgr.status(), LicenseStatus::Invalid);
 
     mgr.mark_expired();
     assert!(!mgr.is_licensed());
@@ -383,7 +382,7 @@ fn trial_dates_must_define_a_valid_finite_interval() {
 }
 
 #[test]
-fn invalid_trial_reload_preserves_a_valid_existing_license() {
+fn invalid_trial_reload_disables_an_existing_license() {
     let (keypair, public_key) = generate_test_keypair();
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
@@ -397,8 +396,8 @@ fn invalid_trial_reload_preserves_a_valid_existing_license() {
     payload.as_object_mut().unwrap().remove("expires_at");
     std::fs::write(file.path(), sign_payload(&keypair, &payload.to_string())).unwrap();
     assert!(manager.reload(file.path()).is_err());
-    assert_eq!(manager.status(), LicenseStatus::Valid);
-    assert!(manager.is_licensed());
+    assert_eq!(manager.status(), LicenseStatus::Invalid);
+    assert!(!manager.is_licensed());
     assert!(!LicenseManager::new(Some(file.path()), &public_key).is_licensed());
 }
 
@@ -439,4 +438,22 @@ fn commercial_license_without_expiry_remains_compatible() {
         LicenseManager::new(Some(file.path()), &public_key).status(),
         LicenseStatus::Valid
     );
+}
+
+#[test]
+fn running_manager_enforces_expiry_without_reload() {
+    let (keypair, public_key) = generate_test_keypair();
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(2);
+    let payload = trial_license_json(&expires.to_rfc3339());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), sign_payload(&keypair, &payload)).unwrap();
+    let manager = LicenseManager::new(Some(file.path()), &public_key);
+    assert!(manager.is_licensed());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        !manager.is_licensed(),
+        "running manager kept an expired trial operational"
+    );
+    assert_eq!(manager.status(), LicenseStatus::Expired);
+    assert_eq!(manager.header_value(), Some("expired"));
 }
