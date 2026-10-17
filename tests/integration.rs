@@ -351,3 +351,92 @@ fn test_verify_with_trailing_whitespace() {
     let license = LicenseVerifier::verify(&data, &public_key).unwrap();
     assert_eq!(license.license_id, "lic-001");
 }
+
+#[test]
+fn trial_dates_must_define_a_valid_finite_interval() {
+    let (keypair, public_key) = generate_test_keypair();
+    let original: serde_json::Value =
+        serde_json::from_str(&trial_license_json("2099-12-31T23:59:59Z")).unwrap();
+    for (field, value) in [
+        ("expires_at", serde_json::Value::Null),
+        ("expires_at", serde_json::json!("")),
+        ("expires_at", serde_json::json!("not-a-date")),
+        ("expires_at", serde_json::json!("2099-02-30T00:00:00Z")),
+        ("expires_at", serde_json::json!("2026-01-01T00:00:00Z")),
+        ("expires_at", serde_json::json!("2025-12-31T23:59:59Z")),
+        ("issued_at", serde_json::json!("not-a-date")),
+    ] {
+        let mut payload = original.clone();
+        payload[field] = value;
+        let signed = sign_payload(&keypair, &payload.to_string());
+        assert!(
+            LicenseVerifier::verify(&signed, &public_key).is_err(),
+            "accepted {payload}"
+        );
+    }
+    let mut missing = original;
+    missing.as_object_mut().unwrap().remove("expires_at");
+    assert!(
+        LicenseVerifier::verify(&sign_payload(&keypair, &missing.to_string()), &public_key)
+            .is_err()
+    );
+}
+
+#[test]
+fn invalid_trial_reload_preserves_a_valid_existing_license() {
+    let (keypair, public_key) = generate_test_keypair();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        sign_payload(&keypair, &perpetual_license_json()),
+    )
+    .unwrap();
+    let manager = LicenseManager::new(Some(file.path()), &public_key);
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&trial_license_json("2099-12-31T23:59:59Z")).unwrap();
+    payload.as_object_mut().unwrap().remove("expires_at");
+    std::fs::write(file.path(), sign_payload(&keypair, &payload.to_string())).unwrap();
+    assert!(manager.reload(file.path()).is_err());
+    assert_eq!(manager.status(), LicenseStatus::Valid);
+    assert!(manager.is_licensed());
+    assert!(!LicenseManager::new(Some(file.path()), &public_key).is_licensed());
+}
+
+#[test]
+fn valid_trial_dates_respect_offsets_and_expiry() {
+    let (keypair, public_key) = generate_test_keypair();
+    for (issued, expires, status) in [
+        (
+            "2026-01-01T01:00:00+01:00",
+            "2099-12-31T23:59:59Z",
+            LicenseStatus::Trial,
+        ),
+        (
+            "2020-01-01T00:00:00Z",
+            "2020-01-15T00:00:00Z",
+            LicenseStatus::Expired,
+        ),
+    ] {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&trial_license_json(expires)).unwrap();
+        payload["issued_at"] = serde_json::json!(issued);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), sign_payload(&keypair, &payload.to_string())).unwrap();
+        let manager = LicenseManager::new(Some(file.path()), &public_key);
+        assert_eq!(manager.status(), status);
+    }
+}
+
+#[test]
+fn commercial_license_without_expiry_remains_compatible() {
+    let (keypair, public_key) = generate_test_keypair();
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&commercial_license_json("2099-12-31T23:59:59Z")).unwrap();
+    payload.as_object_mut().unwrap().remove("expires_at");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), sign_payload(&keypair, &payload.to_string())).unwrap();
+    assert_eq!(
+        LicenseManager::new(Some(file.path()), &public_key).status(),
+        LicenseStatus::Valid
+    );
+}
