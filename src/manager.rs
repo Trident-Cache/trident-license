@@ -1,190 +1,172 @@
-//! License management with atomic fast-path checks.
+//! Runtime license management with date checks on every access.
 
 #[cfg(feature = "licensing")]
 mod licensed {
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use parking_lot::RwLock;
-    use tracing::{info, warn};
-
     use crate::types::{License, LicenseStatus, LicenseType};
     use crate::verifier::{LicenseError, LicenseVerifier};
+    use chrono::{DateTime, Utc};
+    use parking_lot::RwLock;
+    use std::path::Path;
+    use tracing::{info, warn};
 
-    /// Manages license state with a fast atomic check path.
-    ///
-    /// The `is_licensed()` method uses an `AtomicBool` for near-zero overhead
-    /// on the hot request path. Detailed status is behind a `RwLock` for
-    /// logging and header injection.
+    // Publish status and expiry together so concurrent reloads cannot mix
+    // entitlement state from one licence with dates from another.
+    struct State {
+        status: LicenseStatus,
+        expires: Option<DateTime<Utc>>,
+    }
+
+    impl State {
+        fn from_license(license: &License) -> Self {
+            if license.license_type == LicenseType::Perpetual {
+                return Self {
+                    status: LicenseStatus::Valid,
+                    expires: None,
+                };
+            }
+            let expires = match license.expires_at.as_deref() {
+                Some(value) => match DateTime::parse_from_rfc3339(value) {
+                    Ok(date) => Some(date.with_timezone(&Utc)),
+                    Err(_) => {
+                        return Self {
+                            status: LicenseStatus::Expired,
+                            expires: None,
+                        }
+                    }
+                },
+                None => None,
+            };
+            Self {
+                status: if license.license_type == LicenseType::Trial {
+                    LicenseStatus::Trial
+                } else {
+                    LicenseStatus::Valid
+                },
+                expires,
+            }
+        }
+
+        fn status_at(&self, now: DateTime<Utc>) -> LicenseStatus {
+            if self.status.is_operational() && self.expires.is_some_and(|date| now >= date) {
+                LicenseStatus::Expired
+            } else {
+                self.status
+            }
+        }
+    }
+
+    /// Checks the cached, verified expiry on every licence access. No file I/O
+    /// or signature verification is performed on the request path.
     pub struct LicenseManager {
-        licensed: AtomicBool,
-        status: RwLock<LicenseStatus>,
-        license: RwLock<Option<License>>,
+        state: RwLock<State>,
         public_key: [u8; 32],
     }
 
     impl LicenseManager {
-        /// Create a new LicenseManager by loading and verifying a license file.
-        ///
-        /// If `path` is `None`, returns an unlicensed manager.
         pub fn new(path: Option<&Path>, public_key: &[u8; 32]) -> Self {
-            let Some(path) = path else {
-                return Self::unlicensed(public_key);
-            };
-
-            match LicenseVerifier::verify_file(path, public_key) {
-                Ok(license) => {
-                    let status = Self::determine_status(&license);
-                    let licensed = status.is_operational();
-
-                    Self {
-                        licensed: AtomicBool::new(licensed),
-                        status: RwLock::new(status),
-                        license: RwLock::new(Some(license)),
-                        public_key: *public_key,
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, path = %path.display(), "Failed to load license file");
-                    Self {
-                        licensed: AtomicBool::new(false),
-                        status: RwLock::new(LicenseStatus::Invalid),
-                        license: RwLock::new(None),
-                        public_key: *public_key,
-                    }
+            let manager = Self::unlicensed(public_key);
+            if let Some(path) = path {
+                if let Err(error) = manager.reload(path) {
+                    warn!(%error, path = %path.display(), "Failed to load license file");
                 }
             }
+            manager
         }
 
-        /// Create an unlicensed manager.
         pub fn unlicensed(public_key: &[u8; 32]) -> Self {
             Self {
-                licensed: AtomicBool::new(false),
-                status: RwLock::new(LicenseStatus::NoLicense),
-                license: RwLock::new(None),
+                state: RwLock::new(State {
+                    status: LicenseStatus::NoLicense,
+                    expires: None,
+                }),
                 public_key: *public_key,
             }
         }
 
-        /// Fast-path license check (~0 cost per request).
         #[inline]
         pub fn is_licensed(&self) -> bool {
-            self.licensed.load(Ordering::Relaxed)
+            self.status().is_operational()
         }
 
-        /// Get the detailed license status.
         pub fn status(&self) -> LicenseStatus {
-            *self.status.read()
+            self.state.read().status_at(Utc::now())
         }
 
-        /// Get the header value for license status response headers.
-        ///
-        /// Returns `None` when the license is valid (no header needed).
         pub fn header_value(&self) -> Option<&'static str> {
-            self.status.read().header_value()
+            self.status().header_value()
         }
 
-        /// Reload the license from a file path.
+        /// Reload atomically. Any read, signature or payload error revokes the
+        /// previous entitlement immediately; a valid replacement restores it.
         pub fn reload(&self, path: &Path) -> Result<(), LicenseError> {
-            let license = LicenseVerifier::verify_file(path, &self.public_key)?;
-            let status = Self::determine_status(&license);
-            let licensed = status.is_operational();
-
-            self.licensed.store(licensed, Ordering::Relaxed);
-            *self.status.write() = status;
-            *self.license.write() = Some(license);
-
-            Ok(())
+            let mut state = self.state.write();
+            match LicenseVerifier::verify_file(path, &self.public_key) {
+                Ok(license) => {
+                    *state = State::from_license(&license);
+                    Ok(())
+                }
+                Err(error) => {
+                    *state = State {
+                        status: LicenseStatus::Invalid,
+                        expires: None,
+                    };
+                    Err(error)
+                }
+            }
         }
 
-        /// Force the manager into the expired state without reading any file.
-        ///
-        /// `reload` refuses to mutate state unless the new file verifies, so
-        /// a caller that must stop honouring a licence whose file can no
-        /// longer be read — a grace window closing over a deleted or
-        /// corrupted file — has no way to express that through `reload`.
-        /// The parsed licence is kept so status output can still say what
-        /// expired.
         pub fn mark_expired(&self) {
-            self.licensed.store(false, Ordering::Relaxed);
-            *self.status.write() = LicenseStatus::Expired;
+            *self.state.write() = State {
+                status: LicenseStatus::Expired,
+                expires: None,
+            };
         }
 
-        /// Log the current license status at startup.
         pub fn log_status(&self) {
-            let status = *self.status.read();
-            let license = self.license.read();
-
-            match status {
+            let state = self.state.read();
+            let now = Utc::now();
+            match state.status_at(now) {
                 LicenseStatus::Valid => {
-                    if let Some(ref lic) = *license {
-                        if let Some(ref expires) = lic.expires_at {
-                            info!(
-                                license_type = %lic.license_type,
-                                expires = %expires,
-                                "License validated successfully"
-                            );
-                        } else {
-                            info!(
-                                license_type = %lic.license_type,
-                                "License validated successfully (no expiry)"
-                            );
-                        }
-                    }
+                    info!(expires = ?state.expires, "License validated successfully")
                 }
                 LicenseStatus::Trial => {
-                    if let Some(ref lic) = *license {
-                        let remaining = Self::days_remaining(lic);
-                        warn!(days_remaining = remaining, "Trial license active");
-                    }
+                    let remaining = state
+                        .expires
+                        .map(|expires| (expires - now).num_days())
+                        .unwrap_or(0);
+                    warn!(days_remaining = remaining, "Trial license active");
                 }
-                LicenseStatus::Expired => {
-                    warn!("License expired - running in degraded mode");
-                }
+                LicenseStatus::Expired => warn!("License expired - running in degraded mode"),
                 LicenseStatus::NoLicense => {
-                    warn!("No license file configured - running in degraded mode");
+                    warn!("No license file configured - running in degraded mode")
                 }
-                LicenseStatus::Invalid => {
-                    warn!("Invalid license file - running in degraded mode");
-                }
+                LicenseStatus::Invalid => warn!("Invalid license file - running in degraded mode"),
             }
         }
+    }
 
-        fn determine_status(license: &License) -> LicenseStatus {
-            if license.license_type == LicenseType::Perpetual {
-                return LicenseStatus::Valid;
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn expiry_is_inclusive_and_applies_to_trials_and_commercial_licenses() {
+            let expiry = Utc::now();
+            for status in [LicenseStatus::Trial, LicenseStatus::Valid] {
+                let state = State {
+                    status,
+                    expires: Some(expiry),
+                };
+                assert_eq!(
+                    state.status_at(expiry - chrono::Duration::nanoseconds(1)),
+                    status
+                );
+                assert_eq!(state.status_at(expiry), LicenseStatus::Expired);
+                assert_eq!(
+                    state.status_at(expiry + chrono::Duration::days(3650)),
+                    LicenseStatus::Expired
+                );
             }
-
-            if let Some(ref expires_at) = license.expires_at {
-                if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                    let now = chrono::Utc::now();
-                    let expires_utc = expires.with_timezone(&chrono::Utc);
-                    if now >= expires_utc {
-                        return LicenseStatus::Expired;
-                    }
-                } else {
-                    return LicenseStatus::Expired;
-                }
-            }
-
-            match license.license_type {
-                LicenseType::Trial => LicenseStatus::Trial,
-                LicenseType::Commercial => LicenseStatus::Valid,
-                LicenseType::Perpetual => LicenseStatus::Valid,
-            }
-        }
-
-        fn days_remaining(license: &License) -> i64 {
-            license
-                .expires_at
-                .as_deref()
-                .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
-                .map(|expires| {
-                    let now = chrono::Utc::now();
-                    let expires_utc = expires.with_timezone(&chrono::Utc);
-                    (expires_utc - now).num_days()
-                })
-                .unwrap_or(0)
         }
     }
 }
