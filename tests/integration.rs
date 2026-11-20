@@ -440,11 +440,41 @@ fn commercial_license_without_expiry_remains_compatible() {
     );
 }
 
+/// The time `seconds` from now as an RFC 3339 timestamp in UTC, to the
+/// nanosecond.
+fn rfc3339_from_now(seconds: u64) -> String {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        + std::time::Duration::from_secs(seconds);
+    let (days, of_day) = (at.as_secs() / 86_400, at.as_secs() % 86_400);
+    // Day number to date, counting years from March so the leap day is last.
+    let days = days + 719_468;
+    let (era, day_of_era) = (days / 146_097, days % 146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z",
+        of_day / 3_600,
+        of_day % 3_600 / 60,
+        of_day % 60,
+        at.subsec_nanos()
+    )
+}
+
 #[test]
 fn running_manager_enforces_expiry_without_reload() {
     let (keypair, public_key) = generate_test_keypair();
-    let expires = chrono::Utc::now() + chrono::Duration::seconds(2);
-    let payload = trial_license_json(&expires.to_rfc3339());
+    let payload = trial_license_json(&rfc3339_from_now(2));
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), sign_payload(&keypair, &payload)).unwrap();
     let manager = LicenseManager::new(Some(file.path()), &public_key);

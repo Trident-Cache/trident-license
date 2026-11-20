@@ -2,9 +2,9 @@
 
 #[cfg(feature = "licensing")]
 mod licensed {
+    use crate::timestamp::Timestamp;
     use crate::types::{License, LicenseStatus, LicenseType};
     use crate::verifier::{LicenseError, LicenseVerifier};
-    use chrono::{DateTime, Utc};
     use parking_lot::RwLock;
     use std::path::Path;
     use tracing::{info, warn};
@@ -13,7 +13,7 @@ mod licensed {
     // entitlement state from one licence with dates from another.
     struct State {
         status: LicenseStatus,
-        expires: Option<DateTime<Utc>>,
+        expires: Option<Timestamp>,
     }
 
     impl State {
@@ -25,15 +25,15 @@ mod licensed {
                 };
             }
             let expires = match license.expires_at.as_deref() {
-                Some(value) => match DateTime::parse_from_rfc3339(value) {
-                    Ok(date) => Some(date.with_timezone(&Utc)),
-                    Err(_) => {
+                Some(value) => {
+                    let Some(date) = Timestamp::parse_rfc3339(value) else {
                         return Self {
                             status: LicenseStatus::Expired,
                             expires: None,
-                        }
-                    }
-                },
+                        };
+                    };
+                    Some(date)
+                }
                 None => None,
             };
             Self {
@@ -46,7 +46,7 @@ mod licensed {
             }
         }
 
-        fn status_at(&self, now: DateTime<Utc>) -> LicenseStatus {
+        fn status_at(&self, now: Timestamp) -> LicenseStatus {
             if self.status.is_operational() && self.expires.is_some_and(|date| now >= date) {
                 LicenseStatus::Expired
             } else {
@@ -89,7 +89,7 @@ mod licensed {
         }
 
         pub fn status(&self) -> LicenseStatus {
-            self.state.read().status_at(Utc::now())
+            self.state.read().status_at(Timestamp::now())
         }
 
         pub fn header_value(&self) -> Option<&'static str> {
@@ -124,7 +124,7 @@ mod licensed {
 
         pub fn log_status(&self) {
             let state = self.state.read();
-            let now = Utc::now();
+            let now = Timestamp::now();
             match state.status_at(now) {
                 LicenseStatus::Valid => {
                     info!(expires = ?state.expires, "License validated successfully")
@@ -132,7 +132,7 @@ mod licensed {
                 LicenseStatus::Trial => {
                     let remaining = state
                         .expires
-                        .map(|expires| (expires - now).num_days())
+                        .map(|expires| now.whole_days_until(expires))
                         .unwrap_or(0);
                     warn!(days_remaining = remaining, "Trial license active");
                 }
@@ -151,19 +151,16 @@ mod licensed {
 
         #[test]
         fn expiry_is_inclusive_and_applies_to_trials_and_commercial_licenses() {
-            let expiry = Utc::now();
+            let expiry = Timestamp::now();
             for status in [LicenseStatus::Trial, LicenseStatus::Valid] {
                 let state = State {
                     status,
                     expires: Some(expiry),
                 };
-                assert_eq!(
-                    state.status_at(expiry - chrono::Duration::nanoseconds(1)),
-                    status
-                );
+                assert_eq!(state.status_at(expiry.offset_by(0, -1)), status);
                 assert_eq!(state.status_at(expiry), LicenseStatus::Expired);
                 assert_eq!(
-                    state.status_at(expiry + chrono::Duration::days(3650)),
+                    state.status_at(expiry.offset_by(3650 * 86_400, 0)),
                     LicenseStatus::Expired
                 );
             }

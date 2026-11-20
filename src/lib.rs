@@ -8,6 +8,7 @@
 //! and `is_licensed()` always returns `true`.
 
 pub mod manager;
+mod timestamp;
 pub mod types;
 pub mod verifier;
 
