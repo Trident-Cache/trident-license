@@ -37,6 +37,22 @@ pub struct License {
     pub features: Vec<String>,
 }
 
+impl License {
+    /// When this licence stops being valid, as seconds since the Unix epoch.
+    ///
+    /// `None` for a perpetual licence, for one that states no expiry, and for
+    /// one whose `expires_at` is not an RFC 3339 timestamp. Read by the same
+    /// code that enforces the expiry, so a caller that reports the date and
+    /// the manager that acts on it cannot disagree about what it says.
+    pub fn expires_at_unix(&self) -> Option<i64> {
+        if self.license_type == LicenseType::Perpetual {
+            return None;
+        }
+        let stated = self.expires_at.as_deref()?;
+        crate::timestamp::Timestamp::parse_rfc3339(stated).map(|at| at.unix_seconds())
+    }
+}
+
 fn default_product() -> String {
     "trident-cache".to_string()
 }

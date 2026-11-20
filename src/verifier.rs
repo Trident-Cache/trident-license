@@ -6,6 +6,8 @@ use base64::Engine;
 use ring::signature;
 
 #[cfg(feature = "licensing")]
+use crate::timestamp::Timestamp;
+#[cfg(feature = "licensing")]
 use crate::types::License;
 
 /// Errors that can occur during license verification.
@@ -96,14 +98,14 @@ impl LicenseVerifier {
         // reports Expired, and consumers can apply their existing grace policy.
         if license.license_type == crate::types::LicenseType::Trial {
             let invalid = |message: &str| LicenseError::InvalidPayload(message.to_owned());
-            let issued = chrono::DateTime::parse_from_rfc3339(&license.issued_at)
-                .map_err(|_| invalid("trial issued_at must be an RFC 3339 timestamp"))?;
+            let issued = Timestamp::parse_rfc3339(&license.issued_at)
+                .ok_or_else(|| invalid("trial issued_at must be an RFC 3339 timestamp"))?;
             let expires = license
                 .expires_at
                 .as_deref()
                 .ok_or_else(|| invalid("trial expires_at is required"))?;
-            let expires = chrono::DateTime::parse_from_rfc3339(expires)
-                .map_err(|_| invalid("trial expires_at must be an RFC 3339 timestamp"))?;
+            let expires = Timestamp::parse_rfc3339(expires)
+                .ok_or_else(|| invalid("trial expires_at must be an RFC 3339 timestamp"))?;
             if expires <= issued {
                 return Err(invalid("trial expires_at must be after issued_at"));
             }
